@@ -18,15 +18,14 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
 # ================= 設定區 =================
-# 從環境變數讀取憑證 (GitHub Secrets)
+# 從 GitHub Secrets 讀取
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-# 從環境變數讀取日曆 ID，若無則報錯
 CALENDAR_ID = os.getenv("CALENDAR_ID")
 
-# 若沒有環境變數，嘗試讀取本地檔案 (測試用)
+# 本地測試用 (如果本地有檔案)
 SERVICE_ACCOUNT_FILE = 'credentials.json'
 
-# ================= Google Calendar 工具函式 =================
+# ================= Google Calendar 核心功能 =================
 def get_calendar_service():
     scopes = ['https://www.googleapis.com/auth/calendar']
     creds = None
@@ -34,11 +33,10 @@ def get_calendar_service():
     if GOOGLE_CREDENTIALS_JSON:
         print("[Info] 使用環境變數中的憑證")
         try:
-            # 嘗試直接解析 JSON
             info = json.loads(GOOGLE_CREDENTIALS_JSON)
             creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-        except json.JSONDecodeError:
-            # 若失敗，嘗試 Base64 解碼 (有時候 Secret 會存成 Base64)
+        except:
+            # 嘗試 Base64 解碼 (防止 Secret 格式問題)
             try:
                 decoded = base64.b64decode(GOOGLE_CREDENTIALS_JSON).decode("utf-8")
                 info = json.loads(decoded)
@@ -50,40 +48,42 @@ def get_calendar_service():
         print("[Info] 使用本地 credentials.json")
         creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
     else:
-        print("[Error] 找不到 Google 憑證，請設定 GOOGLE_CREDENTIALS_JSON 環境變數")
+        print("[Error] 找不到 Google 憑證，請設定 Secrets")
         sys.exit(1)
 
     return build('calendar', 'v3', credentials=creds)
 
 def add_event_to_calendar(service, calendar_id, data):
     """
-    寫入日曆事件
-    data 結構: {'code': 'xxx', 'name': 'xxx', 'method': 'xxx', 'date': 'YYYY/MM/DD', 'subject': 'xxx', ...}
+    寫入日曆事件，並設定通知
     """
-    summary = f"📢 {data['code']} {data['name']} 代收價款公告 ({data['method']})"
+    # 標題範例：💰 6904 伯鑫 代收價款 (競價拍賣)
+    icon = "💰" if "競" in data['method'] else "⭕"
+    summary = f"{icon} {data['code']} {data['name']} 代收價款 ({data['method'].split()[0]})"
+    
     description = (
-        f"發行方式：{data['method']}\n"
-        f"主辦券商：{data.get('underwriter', '-')}\n"
-        f"發行總額：{data.get('amount', '-')} 億\n"
-        f"溢價率：{data.get('premium', '-')}\n"
-        f"賣回條件：{data.get('put', '-')}\n"
-        f"主旨：{data['subject']}\n"
-        f"來源：MOPS 公開資訊觀測站"
+        f"【發行資訊】\n"
+        f"• 發行方式：{data['method']}\n"
+        f"• 轉換溢價：{data.get('premium', '-')}\n"
+        f"• 發行總額：{data.get('amount', '-')} 億\n"
+        f"• 主辦券商：{data.get('underwriter', '-')}\n"
+        f"• 發行年期：{data.get('duration', '-')}\n"
+        f"• 賣回條件：{data.get('put', '-')}\n"
+        f"• 擔保狀況：{data.get('tcri', '-')}\n\n"
+        f"【公告內容】\n{data['subject']}\n\n"
+        f"來源：公開資訊觀測站 & 統一證券"
     )
     
-    # 設定時間：預設為當天全天事件，或設定在隔天早上 09:00 提醒
-    # 這裡示範設定為「公告日期的隔天早上 09:00」
-    announce_date = datetime.datetime.strptime(data['date'], "%Y/%m/%d").date()
-    event_date = announce_date + datetime.timedelta(days=1)
+    # 設定時間：預設為「公告當日」的全天事件
+    # 格式轉為 YYYY-MM-DD
+    event_date = data['date'].replace('/', '-')
     
-    start_time = datetime.datetime.combine(event_date, datetime.time(9, 0)).isoformat()
-    end_time = datetime.datetime.combine(event_date, datetime.time(9, 30)).isoformat()
-
-    # 檢查重複 (利用 code 作為 unique key)
-    # 使用 private extended property 來標記
-    unique_key = f"mops_cb_{data['code']}_{data['date'].replace('/', '')}"
+    # 唯一識別碼 (防止重複寫入)
+    unique_key = f"mops_cb_{data['code']}_{event_date.replace('-', '')}"
     
-    print(f"   [Check] 檢查事件是否存在: {unique_key}")
+    print(f"   [Check] 檢查事件: {unique_key}")
+    
+    # 檢查是否已存在
     events_result = service.events().list(
         calendarId=calendar_id,
         privateExtendedProperty=f"uniqueID={unique_key}",
@@ -99,17 +99,15 @@ def add_event_to_calendar(service, calendar_id, data):
         'location': '公開資訊觀測站',
         'description': description,
         'start': {
-            'dateTime': start_time,
-            'timeZone': 'Asia/Taipei',
+            'date': event_date, # 全天事件
         },
         'end': {
-            'dateTime': end_time,
-            'timeZone': 'Asia/Taipei',
+            'date': event_date, # 全天事件 (Google API 若 start=end 則為當天)
         },
         'reminders': {
             'useDefault': False,
             'overrides': [
-                {'method': 'popup', 'minutes': 10}, # 10分鐘前通知
+                {'method': 'popup', 'minutes': 30}, # 30分鐘前通知 (對全天事件來說通常是前一天或當天9點)
             ],
         },
         'extendedProperties': {
@@ -125,21 +123,19 @@ def add_event_to_calendar(service, calendar_id, data):
     except HttpError as e:
         print(f"   [Error] 寫入失敗: {e}")
 
-# ================= 爬蟲邏輯 (從之前的代碼整合) =================
+# ================= 爬蟲邏輯 (MOPS + PSCNET) =================
 
 def parse_premium_value(text):
     try:
         clean_text = text.replace('%', '').strip()
         first_val = re.split(r'[~-]', clean_text)[0]
         match = re.search(r'\d+(\.\d+)?', first_val)
-        if match:
-            return float(match.group(0))
-    except:
-        pass
+        if match: return float(match.group(0))
+    except: pass
     return 0.0
 
-def get_pscnet_db(driver):
-    print("Step 1: 爬取統一證券資料庫...")
+def get_pscnet_detailed_database(driver):
+    print("Step 1: 前往統一證券抓取詳細資料...")
     url = "https://cbas16889.pscnet.com.tw/marketInfo/expectedRelease/"
     driver.get(url)
     time.sleep(5)
@@ -150,8 +146,7 @@ def get_pscnet_db(driver):
     
     if tables:
         for table in tables:
-            try:
-                headers = [th.get_text(strip=True) for th in table.find_all('tr')[0].find_all('th')]
+            try: headers = [th.get_text(strip=True) for th in table.find_all('tr')[0].find_all('th')]
             except: continue
 
             col_idx = {'underwriter': -1, 'amount': -1, 'put': -1, 'duration': -1, 'premium': -1, 'tcri': -1}
@@ -174,20 +169,20 @@ def get_pscnet_db(driver):
                 if "競拍" in row_text or "競價" in row_text: method = "💰 競價拍賣"
                 elif "詢圈" in row_text or "詢價" in row_text: method = "⭕ 詢價圈購"
                 
-                premium_text = col_texts[col_idx['premium']] if col_idx['premium'] != -1 and len(cols) > col_idx['premium'] else "-"
+                premium_text = col_texts[col_idx['premium']] if col_idx['premium']!=-1 and len(cols)>col_idx['premium'] else "-"
                 
+                # 溢價率判斷邏輯
                 if method == "未知" and premium_text != "-":
                     if parse_premium_value(premium_text) > 105:
                         method = "⭕ 詢價圈購 (溢價率>105%)"
 
+                # 抓取代號
                 code_match = re.search(r'\d{4}', row_text)
                 if code_match:
                     possible = re.findall(r'\d{4}', row_text)
                     stock_code = None
                     for c in possible:
-                        if not c.startswith("202"):
-                            stock_code = c
-                            break
+                        if not c.startswith("202"): stock_code = c; break
                     
                     if stock_code and method != "未知":
                         psc_db[stock_code] = {
@@ -196,22 +191,27 @@ def get_pscnet_db(driver):
                             "amount": col_texts[col_idx['amount']] if col_idx['amount']!=-1 else "-",
                             "underwriter": col_texts[col_idx['underwriter']] if col_idx['underwriter']!=-1 else "-",
                             "put": col_texts[col_idx['put']] if col_idx['put']!=-1 else "-",
+                            "duration": col_texts[col_idx['duration']] if col_idx['duration']!=-1 else "-",
+                            "tcri": col_texts[col_idx['tcri']] if col_idx['tcri']!=-1 else "-"
                         }
+    print(f"   統一證券資料庫建立完成: {len(psc_db)} 筆")
     return psc_db
 
-def fetch_mops_data(driver, psc_db):
-    print("Step 2: 爬取 MOPS 當日公告...")
+def fetch_and_process_mops(driver, psc_db):
+    print("Step 2: 抓取 MOPS 當日公告...")
+    
+    # 自動取得「今天」日期
     now = datetime.datetime.now()
-    # 轉換為民國年
-    year = str(now.year - 1911)
-    month = str(now.month)
-    day = str(now.day).zfill(2)
+    # 轉民國年
+    target_year = str(now.year - 1911)
+    target_month = str(now.month)
+    target_day = str(now.day).zfill(2)
     
-    # 測試用：強制指定有資料的日期 (正式使用請註解掉這三行)
-    # year, month, day = "114", "12", "04"
+    # ★★★ 測試用：若要在今天(非交易日)測試，可暫時解開下面這行 ★★★
+    # target_year, target_month, target_day = "114", "12", "04"
     
-    url = f"https://mopsplus.twse.com.tw/mops/#/web/t05st02?year={year}&month={month}&day={day}"
-    print(f"Target: {year}/{month}/{day}")
+    url = f"https://mopsplus.twse.com.tw/mops/#/web/t05st02?year={target_year}&month={target_month}&day={target_day}"
+    print(f"   Target URL: {url}")
     
     driver.get(url)
     time.sleep(5)
@@ -220,6 +220,7 @@ def fetch_mops_data(driver, psc_db):
     rows = soup.find_all("tr")
     
     results = []
+    found_any = False
     
     for row in rows:
         row_text = row.get_text()
@@ -236,37 +237,40 @@ def fetch_mops_data(driver, psc_db):
                     break
             
             if code != "N/A":
+                found_any = True
                 info = psc_db.get(code, {})
                 subject = row_text.split("公告")[1] if "公告" in row_text else row_text
                 
-                item = {
+                data = {
                     'code': code,
                     'name': name,
                     'subject': subject.strip(),
-                    'date': f"{int(year)+1911}/{month}/{day}", # 存西元年方便 Calendar 處理
+                    'date': f"{int(target_year)+1911}/{target_month}/{target_day}",
                     'method': info.get('method', "❓ 未知"),
                     'premium': info.get('premium', "-"),
                     'amount': info.get('amount', "-"),
                     'underwriter': info.get('underwriter', "-"),
-                    'put': info.get('put', "-")
+                    'put': info.get('put', "-"),
+                    'duration': info.get('duration', "-"),
+                    'tcri': info.get('tcri', "-")
                 }
-                results.append(item)
-                print(f"   Found: {code} {name} ({item['method']})")
-                
+                results.append(data)
+                print(f"   Found Target: {code} {name}")
+
+    if not found_any:
+        print("   ⚠️ 本日無代收價款公告。")
+    
     return results
 
 # ================= 主程式 =================
 def main():
-    # 0. 初始化 Calendar Service
     if not CALENDAR_ID:
-        print("[Error] 未設定 CALENDAR_ID 環境變數")
-        sys.exit(1)
-        
-    calendar_service = get_calendar_service()
-    
-    # 1. 初始化 Selenium
+        print("[Error] 請先在 GitHub Secrets 設定 CALENDAR_ID")
+        return
+
+    # 1. 初始化 Selenium (Headless 模式)
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless") # 無頭模式 (GitHub Actions 必須)
+    options.add_argument("--headless") # 關鍵：GitHub Actions 無法顯示視窗
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-blink-features=AutomationControlled") 
@@ -275,23 +279,24 @@ def main():
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     
     try:
-        # 2. 爬取資料
-        db = get_pscnet_db(driver)
-        data_list = fetch_mops_data(driver, db)
+        # 2. 爬蟲流程
+        db = get_pscnet_detailed_database(driver)
+        final_data = fetch_and_process_mops(driver, db)
         
         # 3. 寫入日曆
-        if data_list:
-            print(f"Step 3: 寫入 {len(data_list)} 筆資料到 Google Calendar...")
-            for data in data_list:
-                add_event_to_calendar(calendar_service, CALENDAR_ID, data)
+        if final_data:
+            print(f"Step 3: 寫入 Google 日曆 ({len(final_data)} 筆)...")
+            service = get_calendar_service()
+            for item in final_data:
+                add_event_to_calendar(service, CALENDAR_ID, item)
         else:
-            print("今日無相關公告。")
+            print("今日無資料需寫入。")
             
     except Exception as e:
-        print(f"[Error] {e}")
-        sys.exit(1)
+        print(f"❌ 發生錯誤: {e}")
+        sys.exit(1) # 回傳錯誤碼讓 GitHub Actions 知道失敗
     finally:
         driver.quit()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
